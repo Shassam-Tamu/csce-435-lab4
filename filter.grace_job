@@ -19,12 +19,14 @@
 #
 ##First Executable Line
 
-# image_size = $1
-# kernel_type = $2
-#
+# Usage: sbatch filter.grace_job <image_size>
+# Example: sbatch filter.grace_job 1024
+
+IMAGE_SIZE=${1:-1024}  # Default to 1024 if not provided
+
 module load CUDA/12.2.0    #load CUDA module
 module load GCCcore/12.2.0
 module load PAPI/7.0.1
 
-CALI_CONFIG="spot(output=output.cali),cuda.gputime,profile.cuda" \
-./filter
+CALI_CONFIG="spot(output=filter_${IMAGE_SIZE}_5x5.cali),cuda.gputime,profile.cuda" \
+./filter ${IMAGE_SIZE}
