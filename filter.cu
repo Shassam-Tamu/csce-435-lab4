@@ -58,7 +58,7 @@ __global__ void filter_shared_vector(unsigned char *a, unsigned char *b, int nx,
   }
   // Left Halo
   if (tx == 0) {
-    for (int k = 0; k < BLOCK_HEIGHT; ++k) {
+    for (int k = 0; k < BLOCK_HEIGHT + 2; ++k) {
       int y_row = iy - 1 + k; 
       y_row = min(ny - 1, max(0, y_row));
       int x_load = max(0, ix - 1);
@@ -70,7 +70,7 @@ __global__ void filter_shared_vector(unsigned char *a, unsigned char *b, int nx,
     for (int k = 0; k < BLOCK_HEIGHT + 2; ++k) {
       int y_row = iy - 1 + k;
       y_row = min(ny - 1, max(0, y_row));
-      int x_load = min(nx - 1, ix + 1);
+      int x_load = min(nx - 1, ix + 4);  
       shared_mem[k][BLOCK_WIDTH * 4 + 1] = a[y_row * nx + x_load];
     }
   }
