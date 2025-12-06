@@ -6,10 +6,11 @@
 #include <caliper/cali-manager.h>
 #include <caliper/cali.h>
 
-__constant__ float c_filter[9];
+__constant__ float c_filter[25];
 
 #define BLOCK_WIDTH 16
 #define BLOCK_HEIGHT 16
+#define FILTER_RADIUS 2
 
 
 /**
@@ -21,7 +22,7 @@ __constant__ float c_filter[9];
  * @param nx image length
  */
 __global__ void filter_shared_vector(unsigned char *a, unsigned char *b, int nx,int ny) {
-  __shared__ unsigned char shared_mem[BLOCK_HEIGHT + 2][BLOCK_WIDTH * 4 +2];
+  __shared__ unsigned char shared_mem[BLOCK_HEIGHT + 4][BLOCK_WIDTH * 4 + 4];
   int tx = threadIdx.x;
   int ty = threadIdx.y;
   int ix = (blockIdx.x * blockDim.x + tx) * 4;
@@ -33,67 +34,78 @@ __global__ void filter_shared_vector(unsigned char *a, unsigned char *b, int nx,
   // Load Main Data Using Vectorized Load
   if (ix < nx && iy < ny) {
     uchar4 val = ((uchar4*)a)[idx_vec];
-    // Unpack into shared memory, offset by 1 for halo
-    shared_mem[ty + 1][tx * 4 + 1] = val.x;
-    shared_mem[ty + 1][tx * 4 + 2] = val.y;
-    shared_mem[ty + 1][tx * 4 + 3] = val.z;
-    shared_mem[ty + 1][tx * 4 + 4] = val.w;
+    // Unpack into shared memory, offset by 2 for halo
+    shared_mem[ty + FILTER_RADIUS][tx * 4 + FILTER_RADIUS] = val.x;
+    shared_mem[ty + FILTER_RADIUS][tx * 4 + FILTER_RADIUS + 1] = val.y;
+    shared_mem[ty + FILTER_RADIUS][tx * 4 + FILTER_RADIUS + 2] = val.z;
+    shared_mem[ty + FILTER_RADIUS][tx * 4 + FILTER_RADIUS + 3] = val.w;
   }
-  // Load Halo Regions
-  // Top Halo
-  if (ty == 0) {
-      int y_load = max(0, iy - 1);
-      for (int k = 0; k < 4; ++k) {
+
+  // Load Halo Regions - need 2 rows/cols on each side for 5x5 filter
+  // Top Halo (2 rows)
+  if (ty < FILTER_RADIUS) {
+    for (int row = 0; row < FILTER_RADIUS; ++row) {
+      if (ty == row) {
+        int y_load = max(0, iy - FILTER_RADIUS + row);
+        for (int k = 0; k < 4; ++k) {
           int x_load = min(nx - 1, max(0, ix + k));
-          shared_mem[0][tx * 4 + 1 + k] = a[y_load * nx + x_load];
+          shared_mem[row][tx * 4 + FILTER_RADIUS + k] = a[y_load * nx + x_load];
+        }
       }
-  }
-  // Bottom Halo
-  if (ty == blockDim.y - 1) {
-      int y_load = min(ny - 1, iy + 1);
-      for (int k = 0; k < 4; ++k) {
-          int x_load = min(nx - 1, max(0, ix + k));
-          shared_mem[BLOCK_HEIGHT + 1][tx * 4 + 1 + k] = a[y_load * nx + x_load];
-      }
-  }
-  // Left Halo
-  if (tx == 0) {
-    for (int k = 0; k < BLOCK_HEIGHT + 2; ++k) {
-      int y_row = iy - 1 + k; 
-      y_row = min(ny - 1, max(0, y_row));
-      int x_load = max(0, ix - 1);
-      shared_mem[k][0] = a[y_row * nx + x_load];
     }
   }
-  // Right Halo
-  if (tx == blockDim.x - 1) {
-    for (int k = 0; k < BLOCK_HEIGHT + 2; ++k) {
-      int y_row = iy - 1 + k;
+  // Bottom Halo (2 rows)
+  if (ty >= blockDim.y - FILTER_RADIUS) {
+    for (int row = 0; row < FILTER_RADIUS; ++row) {
+      if (ty == blockDim.y - FILTER_RADIUS + row) {
+        int y_load = min(ny - 1, iy + FILTER_RADIUS - row);
+        for (int k = 0; k < 4; ++k) {
+          int x_load = min(nx - 1, max(0, ix + k));
+          shared_mem[BLOCK_HEIGHT + FILTER_RADIUS + row][tx * 4 + FILTER_RADIUS + k] = a[y_load * nx + x_load];
+        }
+      }
+    }
+  }
+  // Left Halo (2 cols)
+  if (tx == 0) {
+    for (int k = 0; k < BLOCK_HEIGHT + 2 * FILTER_RADIUS; ++k) {
+      int y_row = iy - FILTER_RADIUS + k;
       y_row = min(ny - 1, max(0, y_row));
-      int x_load = min(nx - 1, ix + 4);  
-      shared_mem[k][BLOCK_WIDTH * 4 + 1] = a[y_row * nx + x_load];
+      for (int col = 0; col < FILTER_RADIUS; ++col) {
+        int x_load = max(0, ix - FILTER_RADIUS + col);
+        shared_mem[k][col] = a[y_row * nx + x_load];
+      }
+    }
+  }
+  // Right Halo (2 cols)
+  if (tx == blockDim.x - 1) {
+    for (int k = 0; k < BLOCK_HEIGHT + 2 * FILTER_RADIUS; ++k) {
+      int y_row = iy - FILTER_RADIUS + k;
+      y_row = min(ny - 1, max(0, y_row));
+      for (int col = 0; col < FILTER_RADIUS; ++col) {
+        int x_load = min(nx - 1, ix + 4 + col);
+        shared_mem[k][BLOCK_WIDTH * 4 + FILTER_RADIUS + col] = a[y_row * nx + x_load];
+      }
     }
   }
 
   __syncthreads();
 
-  // Apply Filter
+  // Apply 5x5 Filter
   if (ix < nx && iy < ny) {
     uchar4 output_val;
     unsigned char* result = (unsigned char*)&output_val;
 
     for (int k = 0; k < 4; ++k) {
-      int s_x = tx * 4 + 1 + k;
-      int s_y = ty + 1;
-      float v = c_filter[0] * shared_mem[s_y - 1][s_x - 1] +
-                c_filter[1] * shared_mem[s_y - 1][s_x] +
-                c_filter[2] * shared_mem[s_y - 1][s_x + 1] +
-                c_filter[3] * shared_mem[s_y][s_x - 1] +
-                c_filter[4] * shared_mem[s_y][s_x] +
-                c_filter[5] * shared_mem[s_y][s_x + 1] +
-                c_filter[6] * shared_mem[s_y + 1][s_x - 1] +
-                c_filter[7] * shared_mem[s_y + 1][s_x] +
-                c_filter[8] * shared_mem[s_y + 1][s_x + 1];
+      int s_x = tx * 4 + FILTER_RADIUS + k;
+      int s_y = ty + FILTER_RADIUS;
+      float v = 0.0f;
+      for (int fy = -FILTER_RADIUS; fy <= FILTER_RADIUS; ++fy) {
+        for (int fx = -FILTER_RADIUS; fx <= FILTER_RADIUS; ++fx) {
+          int filter_idx = (fy + FILTER_RADIUS) * 5 + (fx + FILTER_RADIUS);
+          v += c_filter[filter_idx] * shared_mem[s_y + fy][s_x + fx];
+        }
+      }
       v = min(max(v, 0.0f), 255.0f);
       result[k] = (unsigned char)v;
     }
@@ -110,72 +122,90 @@ __global__ void filter_shared_vector(unsigned char *a, unsigned char *b, int nx,
  * @param nx image length
  */
 __global__ void filter_shared(unsigned char *a, unsigned char *b, int nx, int ny) {
-  __shared__ unsigned char shared_mem[BLOCK_HEIGHT +2][BLOCK_WIDTH + 2];
+  __shared__ unsigned char shared_mem[BLOCK_HEIGHT + 4][BLOCK_WIDTH + 4];
   int tx = threadIdx.x;
   int ty = threadIdx.y;
   int ix = blockIdx.x * blockDim.x + tx;
   int iy = blockIdx.y * blockDim.y + ty;
 
-  //Load Center
-  int load_x = min(nx - 1, max(0, ix));
-  int load_y = min(ny - 1, max(0, iy));
-  shared_mem[ty + 1][tx + 1] = a[load_y * nx + load_x];
-
-  // Load Halo Regions
-  // Load Left Halo
-  if (tx == 0) {
-    load_x = min(nx - 1, max(0, ix - 1));
-    shared_mem[ty + 1][0] = a[load_y * nx + load_x];
-  }
-  // Load Right Halo
-  if (tx == blockDim.x - 1) {
-    load_x = min(nx - 1, ix + 1);
-    shared_mem[ty + 1][BLOCK_WIDTH + 1] = a[load_y * nx + load_x];
-  }
-  // Load Top Halo
-  if (ty == 0) {
-    load_y = min(ny - 1, max(0, iy - 1));
-    load_x = min(nx - 1, max(0, ix));
-    shared_mem[0][tx + 1] = a[load_y * nx + load_x];
-    // Load Top-Left Corner
-    if(tx == 0) {
-      int cx = min(nx - 1, max(0, ix - 1));
-      shared_mem[0][0] = a[load_y * nx + cx];
-    }
-    // Load Top-Right Corner
-    if(tx == blockDim.x - 1) {
-      int cx = min(nx - 1, ix + 1);
-      shared_mem[0][BLOCK_WIDTH + 1] = a[load_y * nx + cx];
-    }
-  }
-  // Load Bottom Halo
-  if (ty == blockDim.y - 1) {
-    load_y = min(ny - 1, max(0, iy + 1));
-    load_x = min(nx - 1, max(0, ix));
-    shared_mem[BLOCK_HEIGHT + 1][tx + 1] = a[load_y * nx + load_x];
-    // Load Bottom-Left Corner
-    if(tx == 0) {
-      int cx = min(nx - 1, max(0, ix - 1));
-      shared_mem[BLOCK_HEIGHT + 1][0] = a[load_y * nx + cx];
-    }
-    // Load Bottom-Right Corner
-    if(tx == blockDim.x - 1) {
-      int cx = min(nx - 1, ix + 1);
-      shared_mem[BLOCK_HEIGHT + 1][BLOCK_WIDTH + 1] = a[load_y * nx + cx];
-    }
-  }
-  __syncthreads();
-  // Apply Filter
+  // Each thread loads its center pixel
   if (ix < nx && iy < ny) {
-    float v = c_filter[0] * shared_mem[ty][tx] +
-              c_filter[1] * shared_mem[ty][tx + 1] +
-              c_filter[2] * shared_mem[ty][tx + 2] +
-              c_filter[3] * shared_mem[ty + 1][tx] +
-              c_filter[4] * shared_mem[ty + 1][tx + 1] +
-              c_filter[5] * shared_mem[ty + 1][tx + 2] +
-              c_filter[6] * shared_mem[ty + 2][tx] +
-              c_filter[7] * shared_mem[ty + 2][tx + 1] +
-              c_filter[8] * shared_mem[ty + 2][tx + 2];
+    shared_mem[ty + FILTER_RADIUS][tx + FILTER_RADIUS] = a[iy * nx + ix];
+  }
+
+  // Load Halo Regions - need 2 pixels on each side for 5x5 filter
+  // Left halo (threads 0 and 1 load columns 0 and 1)
+  if (tx < FILTER_RADIUS) {
+    int halo_x = ix - FILTER_RADIUS;
+    int clamped_x = max(0, halo_x);
+    int clamped_y = min(ny - 1, max(0, iy));
+    shared_mem[ty + FILTER_RADIUS][tx] = a[clamped_y * nx + clamped_x];
+  }
+  // Right halo (threads 14 and 15 load columns 18 and 19)
+  if (tx >= BLOCK_WIDTH - FILTER_RADIUS) {
+    int halo_x = ix + FILTER_RADIUS;
+    int clamped_x = min(nx - 1, halo_x);
+    int clamped_y = min(ny - 1, max(0, iy));
+    shared_mem[ty + FILTER_RADIUS][tx + 2 * FILTER_RADIUS] = a[clamped_y * nx + clamped_x];
+  }
+  // Top halo (threads with ty 0 and 1 load rows 0 and 1)
+  if (ty < FILTER_RADIUS) {
+    int halo_y = iy - FILTER_RADIUS;
+    int clamped_y = max(0, halo_y);
+    int clamped_x = min(nx - 1, max(0, ix));
+    shared_mem[ty][tx + FILTER_RADIUS] = a[clamped_y * nx + clamped_x];
+  }
+  // Bottom halo (threads with ty 14 and 15 load rows 18 and 19)
+  if (ty >= BLOCK_HEIGHT - FILTER_RADIUS) {
+    int halo_y = iy + FILTER_RADIUS;
+    int clamped_y = min(ny - 1, halo_y);
+    int clamped_x = min(nx - 1, max(0, ix));
+    shared_mem[ty + 2 * FILTER_RADIUS][tx + FILTER_RADIUS] = a[clamped_y * nx + clamped_x];
+  }
+  // Top-left corner
+  if (tx < FILTER_RADIUS && ty < FILTER_RADIUS) {
+    int halo_x = ix - FILTER_RADIUS;
+    int halo_y = iy - FILTER_RADIUS;
+    int clamped_x = max(0, halo_x);
+    int clamped_y = max(0, halo_y);
+    shared_mem[ty][tx] = a[clamped_y * nx + clamped_x];
+  }
+  // Top-right corner
+  if (tx >= BLOCK_WIDTH - FILTER_RADIUS && ty < FILTER_RADIUS) {
+    int halo_x = ix + FILTER_RADIUS;
+    int halo_y = iy - FILTER_RADIUS;
+    int clamped_x = min(nx - 1, halo_x);
+    int clamped_y = max(0, halo_y);
+    shared_mem[ty][tx + 2 * FILTER_RADIUS] = a[clamped_y * nx + clamped_x];
+  }
+  // Bottom-left corner
+  if (tx < FILTER_RADIUS && ty >= BLOCK_HEIGHT - FILTER_RADIUS) {
+    int halo_x = ix - FILTER_RADIUS;
+    int halo_y = iy + FILTER_RADIUS;
+    int clamped_x = max(0, halo_x);
+    int clamped_y = min(ny - 1, halo_y);
+    shared_mem[ty + 2 * FILTER_RADIUS][tx] = a[clamped_y * nx + clamped_x];
+  }
+  // Bottom-right corner
+  if (tx >= BLOCK_WIDTH - FILTER_RADIUS && ty >= BLOCK_HEIGHT - FILTER_RADIUS) {
+    int halo_x = ix + FILTER_RADIUS;
+    int halo_y = iy + FILTER_RADIUS;
+    int clamped_x = min(nx - 1, halo_x);
+    int clamped_y = min(ny - 1, halo_y);
+    shared_mem[ty + 2 * FILTER_RADIUS][tx + 2 * FILTER_RADIUS] = a[clamped_y * nx + clamped_x];
+  }
+
+  __syncthreads();
+
+  // Apply 5x5 Filter
+  if (ix < nx && iy < ny) {
+    float v = 0.0f;
+    for (int fy = -FILTER_RADIUS; fy <= FILTER_RADIUS; ++fy) {
+      for (int fx = -FILTER_RADIUS; fx <= FILTER_RADIUS; ++fx) {
+        int filter_idx = (fy + FILTER_RADIUS) * 5 + (fx + FILTER_RADIUS);
+        v += c_filter[filter_idx] * shared_mem[ty + FILTER_RADIUS + fy][tx + FILTER_RADIUS + fx];
+      }
+    }
     v = min(max(v, 0.0f), 255.0f);
     b[iy * nx + ix] = (unsigned char)v;
   }
@@ -193,19 +223,19 @@ void filter_CPU(const std::vector<unsigned char> &a,
                 std::vector<unsigned char> &b, int nx, int ny,
                 const std::vector<float> &c) {
   auto idx = [&nx](int y, int x) { return y * nx + x; };
+  const int radius = 2;  // 5x5 filter has radius 2
 
   for (int y = 0; y < ny; ++y) {
     for (int x = 0; x < nx; ++x) {
-      int xl = std::max(0, x - 1);
-      int yl = std::max(0, y - 1);
-      int xh = std::min(nx - 1, x + 1);
-      int yh = std::min(ny - 1, y + 1);
-
-      float v =
-          c[0] * a[idx(yl, xl)] + c[1] * a[idx(yl, x)] + c[2] * a[idx(yl, xh)] +
-          c[3] * a[idx(y, xl)] + c[4] * a[idx(y, x)] + c[5] * a[idx(y, xh)] +
-          c[6] * a[idx(yh, xl)] + c[7] * a[idx(yh, x)] + c[8] * a[idx(yh, xh)];
-
+      float v = 0.0f;
+      for (int fy = -radius; fy <= radius; ++fy) {
+        for (int fx = -radius; fx <= radius; ++fx) {
+          int sample_y = std::min(ny - 1, std::max(0, y + fy));
+          int sample_x = std::min(nx - 1, std::max(0, x + fx));
+          int filter_idx = (fy + radius) * 5 + (fx + radius);
+          v += c[filter_idx] * a[idx(sample_y, sample_x)];
+        }
+      }
       uint f = (uint)(v + 0.5f);
       b[idx(y, x)] =
           (unsigned char)std::min(255, std::max(0, static_cast<int>(f)));
@@ -230,8 +260,8 @@ int main(int argc, char* argv[]) {
   const int size = nx * ny;
   const size_t size_bytes = size * sizeof(unsigned char);
 
-  // Filter size (3x3)
-  const int filter_size = 3;
+  // Filter size (5x5)
+  const int filter_size = 5;
 
   // Initialize adiak
   adiak::init(NULL);
@@ -255,9 +285,11 @@ int main(int argc, char* argv[]) {
     input_img[i] = static_cast<unsigned char>(i % 256);
   }
   std::vector<float> host_filter = {
-      1.0f/9.0f, 1.0f/9.0f, 1.0f/9.0f,
-      1.0f/9.0f, 1.0f/9.0f, 1.0f/9.0f,
-      1.0f/9.0f, 1.0f/9.0f, 1.0f/9.0f
+      1.0f/25.0f, 1.0f/25.0f, 1.0f/25.0f, 1.0f/25.0f, 1.0f/25.0f,
+      1.0f/25.0f, 1.0f/25.0f, 1.0f/25.0f, 1.0f/25.0f, 1.0f/25.0f,
+      1.0f/25.0f, 1.0f/25.0f, 1.0f/25.0f, 1.0f/25.0f, 1.0f/25.0f,
+      1.0f/25.0f, 1.0f/25.0f, 1.0f/25.0f, 1.0f/25.0f, 1.0f/25.0f,
+      1.0f/25.0f, 1.0f/25.0f, 1.0f/25.0f, 1.0f/25.0f, 1.0f/25.0f
   };
 
   // Create CUDA events for timing
@@ -294,7 +326,7 @@ int main(int argc, char* argv[]) {
   std::cout << "Host to Device effective bandwidth: " << bandwidth_h2d << " GB/s" << std::endl;
 
   // Copy filter coefficients to constant memory
-  cudaMemcpyToSymbol(c_filter, host_filter.data(), 9 * sizeof(float));
+  cudaMemcpyToSymbol(c_filter, host_filter.data(), 25 * sizeof(float));
 
   // Launch shared memory kernel
   dim3 dimBlock(BLOCK_WIDTH, BLOCK_HEIGHT);
